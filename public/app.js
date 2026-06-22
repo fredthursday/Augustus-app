@@ -5,6 +5,7 @@ const STORAGE_KEYS = {
   PROFILE: "augustus:profile",
   MESSAGES: "augustus:messages",
   TRAITS: "augustus:traits",
+  NOTES: "augustus:notes",
 };
 
 const uid = () => Math.random().toString(36).slice(2) + Date.now().toString(36);
@@ -34,6 +35,7 @@ function saveJSON(key, value) {
 let profile = loadJSON(STORAGE_KEYS.PROFILE, { name: "" });
 let messages = loadJSON(STORAGE_KEYS.MESSAGES, []);
 let traits = loadJSON(STORAGE_KEYS.TRAITS, []);
+let notes = loadJSON(STORAGE_KEYS.NOTES, []); // explicit user-saved notes, distinct from auto-learned traits
 let panelOpen = false;
 let sending = false;
 let pendingFeedbackId = null;
@@ -43,7 +45,8 @@ function persistAll() {
   const ok1 = saveJSON(STORAGE_KEYS.PROFILE, profile);
   const ok2 = saveJSON(STORAGE_KEYS.MESSAGES, messages);
   const ok3 = saveJSON(STORAGE_KEYS.TRAITS, traits);
-  storageError = !(ok1 && ok2 && ok3);
+  const ok4 = saveJSON(STORAGE_KEYS.NOTES, notes);
+  storageError = !(ok1 && ok2 && ok3 && ok4);
 }
 
 // ---------- API calls (via local serverless proxy) ----------
@@ -60,7 +63,10 @@ async function callAugustus(history, systemPrompt) {
     .map((b) => (b.type === "text" ? b.text : ""))
     .filter(Boolean)
     .join("\n");
-  return text || "I couldn't generate a response just now.";
+  return {
+    text: text || "I couldn't generate a response just now.",
+    savedNotes: Array.isArray(data.saved_notes) ? data.saved_notes : [],
+  };
 }
 
 async function extractTraits(userText, assistantText) {
@@ -101,6 +107,9 @@ function buildSystemPrompt() {
     .slice(-5)
     .map((m) => `- Avoid: ${m.note}`)
     .join("\n");
+  const noteLines = notes.length
+    ? notes.map((n) => `- ${n.text}`).join("\n")
+    : "- (none saved yet)";
 
   return `You are Augustus, a personal assistant for ${profile.name || "the user"}.
 
@@ -108,6 +117,11 @@ What you've learned about this person so far:
 ${traitLines}
 
 ${downvoteNotes ? `Recent corrections to apply:\n${downvoteNotes}\n` : ""}
+Things they've explicitly asked you to remember:
+${noteLines}
+
+You have tools available: calculate (math/unit conversions), get_weather, web_search, and save_note. Use them whenever they'd genuinely help — don't ask permission first, just use them. Use save_note only when the user clearly wants something remembered for later (e.g. "remember that...", "save this").
+
 Be genuinely useful, warm, and concise. Adapt your tone and content to what you've learned above. Don't mention that you're "an AI that learns" or narrate this system — just naturally apply what you know.`;
 }
 
@@ -175,6 +189,14 @@ function render() {
                 <button class="remove-trait-btn" data-trait-id="${t.id}" aria-label="Remove">${icon("x", 11)}</button>
               </div>`).join("")}</div>`
         }
+        ${notes.length > 0 ? `
+          <p class="empty-note" style="margin-top:10px;margin-bottom:6px;">Saved notes:</p>
+          <div class="trait-list">${notes.map((n) => `
+            <div class="trait-chip" data-note-id="${n.id}">
+              <span>${escapeHtml(n.text)}</span>
+              <button class="remove-note-btn" data-note-id="${n.id}" aria-label="Remove">${icon("x", 11)}</button>
+            </div>`).join("")}</div>
+        ` : ""}
         <button class="reset-btn" id="resetBtn">${icon("trash", 11)} Reset everything</button>
       </div>
 
@@ -253,6 +275,7 @@ function attachListeners() {
   if (resetBtn) resetBtn.onclick = () => {
     messages = [];
     traits = [];
+    notes = [];
     persistAll();
     render();
   };
@@ -260,6 +283,14 @@ function attachListeners() {
   document.querySelectorAll(".remove-trait-btn").forEach((btn) => {
     btn.onclick = () => {
       traits = traits.filter((t) => t.id !== btn.dataset.traitId);
+      persistAll();
+      render();
+    };
+  });
+
+  document.querySelectorAll(".remove-note-btn").forEach((btn) => {
+    btn.onclick = () => {
+      notes = notes.filter((n) => n.id !== btn.dataset.noteId);
       persistAll();
       render();
     };
@@ -343,8 +374,17 @@ async function handleSend() {
       .filter((m) => !m.pending)
       .slice(-12)
       .map((m) => ({ role: m.role, content: m.text }));
-    const replyText = await callAugustus(history, buildSystemPrompt());
+    const { text: replyText, savedNotes: newSavedNotes } = await callAugustus(history, buildSystemPrompt());
     messages = messages.map((m) => (m.id === pendingMsg.id ? { ...m, text: replyText, pending: false } : m));
+
+    if (newSavedNotes.length) {
+      const existingNoteTexts = new Set(notes.map((n) => n.text.toLowerCase()));
+      const noteAdditions = newSavedNotes
+        .filter((n) => n && !existingNoteTexts.has(n.toLowerCase()))
+        .map((n) => ({ id: uid(), text: n }));
+      if (noteAdditions.length) notes = [...notes, ...noteAdditions];
+    }
+
     persistAll();
     sending = false;
     render();
